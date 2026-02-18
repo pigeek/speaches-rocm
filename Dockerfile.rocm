@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=rocm/pytorch:rocm6.3.4_ubuntu24.04_py3.12_pytorch_release_2.6.0
+ARG BASE_IMAGE=rocm/pytorch:rocm7.0_ubuntu24.04_py3.12_pytorch_release_2.7.1
 # hadolint ignore=DL3006
 FROM ${BASE_IMAGE}
 LABEL org.opencontainers.image.source="https://github.com/pigeek/speaches-rocm"
@@ -18,36 +18,40 @@ ENV HSA_OVERRIDE_GFX_VERSION=11.0.0 \
     GPU_MAX_ALLOC_PERCENT=100 \
     ROCM_PATH=/opt/rocm
 
-WORKDIR /tmp/wheels
-
-# Install CTranslate2 ROCm wheels from official release
+# Download CTranslate2 ROCm wheels (installed into venv later, after uv sync)
 ARG CTRANSLATE2_VERSION=4.7.1
+WORKDIR /tmp/wheels
 RUN curl -L -o rocm-wheels.zip \
         "https://github.com/OpenNMT/CTranslate2/releases/download/v${CTRANSLATE2_VERSION}/rocm-python-wheels-Linux.zip" && \
     unzip rocm-wheels.zip && \
-    pip install --no-cache-dir ctranslate2-*cp312*linux_x86_64.whl && \
-    rm -rf /tmp/wheels
-
-# Pre-download Silero VAD model (used by streaming STT)
-RUN python3 -c "import torch; torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', trust_repo=True)"
+    rm rocm-wheels.zip
 
 WORKDIR /app
 
 # Install uv for dependency management
 COPY --from=ghcr.io/astral-sh/uv:0.8.22 /uv /bin/uv
 
-# Install project dependencies (without installing the project itself first)
+# Use the base image's venv (which has torch, torchaudio) as our project environment
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+
+# Install project dependencies into the existing /opt/venv
 RUN --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --frozen --compile-bytecode --no-install-project --no-dev
+    uv sync --frozen --compile-bytecode --no-install-project --no-dev --inexact
 
 # Copy project source and install
 COPY . .
-RUN uv sync --frozen --compile-bytecode --no-dev
+RUN uv sync --frozen --compile-bytecode --no-dev --inexact
+
+# Override PyPI ctranslate2 with ROCm version (uv sync installs CPU-only PyPI version)
+RUN uv pip install --no-cache --reinstall \
+        /tmp/wheels/temp-linux/ctranslate2-${CTRANSLATE2_VERSION}-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl && \
+    rm -rf /tmp/wheels
 
 ENV UVICORN_HOST=0.0.0.0 \
     UVICORN_PORT=8000 \
-    PATH="/app/.venv/bin:$PATH" \
+    PATH="/opt/venv/bin:$PATH" \
+    LD_LIBRARY_PATH="/opt/rocm/lib:${LD_LIBRARY_PATH}" \
     HF_HUB_ENABLE_HF_TRANSFER=0 \
     DO_NOT_TRACK=1 \
     GRADIO_ANALYTICS_ENABLED=False \
