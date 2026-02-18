@@ -222,6 +222,70 @@ class WhisperModelManager(BaseModelManager[WhisperModel]):
             f"Transcribed {request.audio.duration} seconds of audio in {time.perf_counter() - timelog_start} seconds"
         )
 
+    @traced_generator()
+    def handle_local_agreement_streaming_request(
+        self,
+        request: TranscriptionRequest,
+        *,
+        min_chunk_sec: float = 1.0,
+        buffer_trimming_sec: float = 15.0,
+        vad_enabled: bool = True,
+        vad_threshold: float = 0.5,
+        vad_min_silence_ms: int = 500,
+        **_kwargs,
+    ) -> Generator[StreamingTranscriptionEvent]:
+        """Stream transcription using LocalAgreement2 for word-level stability.
+
+        Simulates streaming by feeding audio in chunks to WhisperStreamer,
+        yielding committed text deltas.
+        """
+        from speaches.streaming import WhisperStreamer
+
+        timelog_start = time.perf_counter()
+        chunk_samples = int(min_chunk_sec * 16000)
+
+        with self.load_model(request.model) as whisper:
+            streamer = WhisperStreamer(
+                whisper,
+                language=request.language,
+                min_chunk_sec=min_chunk_sec,
+                buffer_trimming_sec=buffer_trimming_sec,
+                vad_enabled=vad_enabled,
+                vad_threshold=vad_threshold,
+                vad_min_silence_ms=vad_min_silence_ms,
+            )
+
+            audio = request.audio.data
+            offset = 0
+            while offset < len(audio):
+                end = min(offset + chunk_samples, len(audio))
+                streamer.push_audio_float32(audio[offset:end])
+                offset = end
+
+                if streamer.should_transcribe():
+                    delta = streamer.transcribe_and_commit()
+                    if delta:
+                        yield openai.types.audio.TranscriptionTextDeltaEvent(
+                            type="transcript.text.delta", delta=delta, logprobs=None
+                        )
+
+            # Finalize
+            final = streamer.finalize()
+            if final:
+                yield openai.types.audio.TranscriptionTextDeltaEvent(
+                    type="transcript.text.delta", delta=final, logprobs=None
+                )
+
+            yield openai.types.audio.TranscriptionTextDoneEvent(
+                type="transcript.text.done", text=streamer.committed_text, logprobs=None
+            )
+
+        logger.info(
+            "Transcribed %.1fs of audio in %.2fs (LocalAgreement2)",
+            request.audio.duration,
+            time.perf_counter() - timelog_start,
+        )
+
     def handle_transcription_request(
         self, request: TranscriptionRequest, **kwargs
     ) -> NonStreamingTranscriptionResponse | Generator[StreamingTranscriptionEvent]:

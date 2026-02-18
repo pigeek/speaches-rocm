@@ -1,0 +1,60 @@
+ARG BASE_IMAGE=rocm/pytorch:rocm6.3.4_ubuntu24.04_py3.12_pytorch_release_2.6.0
+# hadolint ignore=DL3006
+FROM ${BASE_IMAGE}
+LABEL org.opencontainers.image.source="https://github.com/pigeek/speaches-rocm"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.description="speaches with ROCm GPU acceleration (STT+TTS)"
+
+# System dependencies (ffmpeg for audio processing, unzip for wheels)
+# hadolint ignore=DL3008
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates curl ffmpeg unzip && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# ROCm environment
+ENV HSA_OVERRIDE_GFX_VERSION=11.0.0 \
+    GPU_MAX_ALLOC_PERCENT=100 \
+    ROCM_PATH=/opt/rocm
+
+WORKDIR /tmp/wheels
+
+# Install CTranslate2 ROCm wheels from official release
+ARG CTRANSLATE2_VERSION=4.7.1
+RUN curl -L -o rocm-wheels.zip \
+        "https://github.com/OpenNMT/CTranslate2/releases/download/v${CTRANSLATE2_VERSION}/rocm-python-wheels-Linux.zip" && \
+    unzip rocm-wheels.zip && \
+    pip install --no-cache-dir ctranslate2-*cp312*linux_x86_64.whl && \
+    rm -rf /tmp/wheels
+
+# Pre-download Silero VAD model (used by streaming STT)
+RUN python3 -c "import torch; torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', trust_repo=True)"
+
+WORKDIR /app
+
+# Install uv for dependency management
+COPY --from=ghcr.io/astral-sh/uv:0.8.22 /uv /bin/uv
+
+# Install project dependencies (without installing the project itself first)
+RUN --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --frozen --compile-bytecode --no-install-project --no-dev
+
+# Copy project source and install
+COPY . .
+RUN uv sync --frozen --compile-bytecode --no-dev
+
+ENV UVICORN_HOST=0.0.0.0 \
+    UVICORN_PORT=8000 \
+    PATH="/app/.venv/bin:$PATH" \
+    HF_HUB_ENABLE_HF_TRANSFER=0 \
+    DO_NOT_TRACK=1 \
+    GRADIO_ANALYTICS_ENABLED=False \
+    DISABLE_TELEMETRY=1 \
+    HF_HUB_DISABLE_TELEMETRY=1
+
+RUN mkdir -p /root/.cache/huggingface/hub
+
+EXPOSE 8000
+CMD ["uvicorn", "--factory", "speaches.main:create_app"]

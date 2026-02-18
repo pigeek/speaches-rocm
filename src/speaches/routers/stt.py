@@ -19,6 +19,7 @@ from speaches.api_types import (
 )
 from speaches.dependencies import (
     AudioFileDependency,
+    ConfigDependency,
     ExecutorRegistryDependency,
 )
 from speaches.executors.shared.handler_protocol import (
@@ -123,6 +124,7 @@ def transcription_response_to_http_response(
 )
 def transcribe_file(
     executor_registry: ExecutorRegistryDependency,
+    config: ConfigDependency,
     request: Request,
     audio: AudioFileDependency,
     model: Annotated[ModelId, Form()],
@@ -139,6 +141,7 @@ def transcribe_file(
     # non standard parameters
     hotwords: Annotated[str | None, Form()] = None,
     without_timestamps: Annotated[bool, Form()] = True,
+    local_agreement: Annotated[bool, Form()] = False,
 ) -> Response | StreamingResponse:
     timestamp_granularities = asyncio.run(get_timestamp_granularities(request))
     if timestamp_granularities != DEFAULT_TIMESTAMP_GRANULARITIES and response_format != "verbose_json":
@@ -168,6 +171,22 @@ def transcribe_file(
         vad_options=DEFAULT_VAD_OPTIONS,
         without_timestamps=without_timestamps,
     )
+
+    # Use LocalAgreement2 streaming if requested
+    if local_agreement and stream:
+        from speaches.executors.whisper import WhisperModelManager
+
+        if isinstance(transcription_executor.model_manager, WhisperModelManager):
+            res = transcription_executor.model_manager.handle_local_agreement_streaming_request(
+                transcription_request,
+                min_chunk_sec=config.streaming_min_chunk_sec,
+                buffer_trimming_sec=config.streaming_buffer_trimming_sec,
+                vad_enabled=config.streaming_vad_enabled,
+                vad_threshold=config.streaming_vad_threshold,
+                vad_min_silence_ms=config.streaming_vad_min_silence_ms,
+            )
+            return transcription_response_to_http_response(res)
+
     res = transcription_executor.model_manager.handle_transcription_request(transcription_request)
     http_res = transcription_response_to_http_response(res)
     return http_res

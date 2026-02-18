@@ -99,6 +99,21 @@ class Config(BaseSettings):
 
     whisper: WhisperConfig = WhisperConfig()
 
+    streaming_min_chunk_sec: float = 1.0
+    """Minimum audio duration (seconds) before first streaming transcription."""
+
+    streaming_buffer_trimming_sec: float = 15.0
+    """Trim audio buffer when it exceeds this duration (seconds)."""
+
+    streaming_vad_enabled: bool = True
+    """Enable Silero VAD for silence-triggered early transcription."""
+
+    streaming_vad_threshold: float = 0.5
+    """Speech probability threshold for VAD (0-1)."""
+
+    streaming_vad_min_silence_ms: int = 500
+    """Minimum silence duration (ms) to trigger end-of-speech."""
+
     # TODO: remove the underscore prefix from the field name
     _unstable_vad_filter: bool = True
     """
