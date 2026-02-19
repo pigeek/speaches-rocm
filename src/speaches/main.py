@@ -94,6 +94,16 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
             executor_registry.download_model_by_id(model_id)
             logger.info(f"Successfully downloaded model: {model_id}")
 
+    # Warm up models at startup so first request is instant
+    executor_registry = get_executor_registry()
+    executor_registry.warmup_model_by_id("Systran/faster-whisper-large-v3")
+    logger.info("Whisper model warmed up")
+
+    from speaches.streaming.vad import _get_vad_model
+
+    _get_vad_model()
+    logger.info("Silero VAD model warmed up")
+
     yield
 
 

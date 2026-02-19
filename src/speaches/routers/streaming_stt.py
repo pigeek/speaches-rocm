@@ -1,8 +1,11 @@
 """WebSocket endpoint for live streaming transcription with LocalAgreement2.
 
-Provides a WebSocket-based streaming STT endpoint that accepts live PCM audio
-and returns incremental committed transcription text using the LocalAgreement2
-algorithm for word-level stability.
+Faithful port of the faster-whisper-ws handler_v2.py architecture:
+- Receive loop starts immediately, buffering audio during model load
+- Background streaming loop waits on events (new_audio / silence / stop)
+- asyncio.wait(FIRST_COMPLETED) for zero-latency wakeup
+- Stop signals the streaming loop to exit after current transcription finishes
+- No task cancellation — in-flight transcription results are preserved
 
 Protocol:
   Client sends:
@@ -18,11 +21,15 @@ Protocol:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from speaches.dependencies import ConfigDependency, ExecutorRegistryDependency
+# CRITICAL: These MUST NOT be in TYPE_CHECKING — FastAPI needs them at runtime
+# for dependency injection. ruff TC001 will try to move them; add noqa if needed.
+from speaches.dependencies import ConfigDependency, ExecutorRegistryDependency  # noqa: TC001
 from speaches.streaming import WhisperStreamer
 
 logger = logging.getLogger(__name__)
@@ -40,92 +47,187 @@ async def streaming_transcription(
     model: str = DEFAULT_MODEL,
     language: str | None = None,
 ) -> None:
-    """WebSocket endpoint for live streaming transcription with LocalAgreement2.
-
-    Query parameters:
-        model: Whisper model ID (default: Systran/faster-whisper-large-v3)
-        language: Language code (e.g. "en") or None for auto-detect
-
-    After connection, send raw PCM16 audio as binary frames.
-    Send {"type": "stop"} JSON to finalize and get remaining text.
-    """
     await ws.accept()
     logger.info("Streaming STT WebSocket connected (model=%s, language=%s)", model, language)
 
-    # Get the whisper executor and load the model
-    whisper_executor = executor_registry._whisper_executor
-    model_ctx = whisper_executor.model_manager.load_model(model)
-    whisper_model = model_ctx.__enter__()
+    loop = asyncio.get_event_loop()
+
+    # Shared state
+    stop_event = asyncio.Event()
+    disconnected = asyncio.Event()
+    new_audio_event = asyncio.Event()
+    silence_detected_event = asyncio.Event()
+    streamer_ref: list[WhisperStreamer | None] = [None]
+    audio_buffer: list[bytes] = []  # Buffer audio while model loads
+
+    async def _receive_loop() -> None:
+        """Receive messages immediately. Buffers audio until streamer is ready."""
+        try:
+            while not stop_event.is_set():
+                message = await ws.receive()
+
+                if message.get("type") == "websocket.disconnect":
+                    disconnected.set()
+                    stop_event.set()
+                    return
+
+                if message.get("bytes"):
+                    s = streamer_ref[0]
+                    if s is not None:
+                        s.push_audio(message["bytes"])
+                        if s.silence_triggered:
+                            silence_detected_event.set()
+                        new_audio_event.set()
+                    else:
+                        # Model still loading — buffer raw audio
+                        audio_buffer.append(message["bytes"])
+
+                elif message.get("text"):
+                    try:
+                        data = json.loads(message["text"])
+                    except json.JSONDecodeError:
+                        continue
+
+                    if data.get("type") == "stop":
+                        logger.info("Received stop message")
+                        stop_event.set()
+                        return
+
+                    if data.get("type") == "config":
+                        logger.info("Received config: %s", data)
+
+        except WebSocketDisconnect:
+            disconnected.set()
+            stop_event.set()
+        except Exception:  # noqa: BLE001
+            logger.warning("Receiver error", exc_info=True)
+            stop_event.set()
+
+    # Start receiving IMMEDIATELY — audio arrives during model load
+    recv_task = asyncio.create_task(_receive_loop())
+
+    # Load model concurrently with audio reception
+    whisper_executor = executor_registry._whisper_executor  # noqa: SLF001
+    model_ctx = await loop.run_in_executor(None, whisper_executor.model_manager.load_model, model)
+    whisper_model = await loop.run_in_executor(None, model_ctx.__enter__)
 
     try:
-        streamer = WhisperStreamer(
-            whisper_model,
-            language=language,
-            min_chunk_sec=config.streaming_min_chunk_sec,
-            buffer_trimming_sec=config.streaming_buffer_trimming_sec,
-            vad_enabled=config.streaming_vad_enabled,
-            vad_threshold=config.streaming_vad_threshold,
-            vad_min_silence_ms=config.streaming_vad_min_silence_ms,
+        # Create streamer
+        streamer = await loop.run_in_executor(
+            None,
+            lambda: WhisperStreamer(
+                whisper_model,
+                language=language,
+                min_chunk_sec=config.streaming_min_chunk_sec,
+                buffer_trimming_sec=config.streaming_buffer_trimming_sec,
+                vad_enabled=config.streaming_vad_enabled,
+                vad_threshold=config.streaming_vad_threshold,
+                vad_min_silence_ms=config.streaming_vad_min_silence_ms,
+            ),
         )
 
-        while True:
-            message = await ws.receive()
+        # Feed buffered audio that arrived during model load
+        if audio_buffer:
+            logger.info("Feeding %d buffered audio chunks to streamer", len(audio_buffer))
+            for chunk in audio_buffer:
+                streamer.push_audio(chunk)
+            audio_buffer.clear()
+            if streamer.should_transcribe():
+                new_audio_event.set()
 
-            if message.get("type") == "websocket.disconnect":
-                break
+        streamer_ref[0] = streamer
+        logger.info("Model and streamer ready")
 
-            if "bytes" in message and message["bytes"]:
-                # Binary frame: raw PCM16 audio
-                pcm_data = message["bytes"]
-                streamer.push_audio(pcm_data)
-
-                if streamer.should_transcribe():
-                    # Run transcription in executor to avoid blocking event loop
-                    delta = await asyncio.get_event_loop().run_in_executor(
-                        None, streamer.transcribe_and_commit
-                    )
-                    if delta:
-                        await ws.send_json({
-                            "type": "transcript",
-                            "text": delta,
-                            "is_final": False,
-                        })
-
-            elif "text" in message and message["text"]:
-                # JSON frame: control message
-                try:
-                    data = json.loads(message["text"])
-                except json.JSONDecodeError:
-                    continue
-
-                msg_type = data.get("type", "")
-
-                if msg_type == "config":
-                    # Allow reconfiguring mid-stream (mainly for first message)
-                    logger.info("Received config: %s", data)
-
-                elif msg_type == "stop":
-                    # Finalize transcription
-                    final = await asyncio.get_event_loop().run_in_executor(
-                        None, streamer.finalize
-                    )
-                    full_text = streamer.committed_text
-                    await ws.send_json({
+        # If stop already arrived during model load, skip streaming and finalize
+        if stop_event.is_set():
+            logger.info("Stop received during model load, finalizing directly")
+            if not disconnected.is_set():
+                final = await loop.run_in_executor(None, streamer.finalize)
+                full_text = streamer.committed_text
+                logger.info("Finalize: full_text='%s'", full_text[:80] if full_text else "")
+                await ws.send_json(
+                    {
                         "type": "transcript",
                         "text": final if final else "",
                         "is_final": True,
                         "full_text": full_text,
-                    })
-                    break
+                    }
+                )
+            return
+
+        # Background streaming loop — waits on events including stop_event
+        # When stop fires, the loop exits AFTER the current transcription finishes
+        # (no cancellation, so in-flight results are preserved)
+        async def _streaming_loop() -> None:
+            try:
+                while not stop_event.is_set():
+                    _done, pending = await asyncio.wait(
+                        [
+                            asyncio.create_task(new_audio_event.wait()),
+                            asyncio.create_task(silence_detected_event.wait()),
+                            asyncio.create_task(stop_event.wait()),
+                        ],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in pending:
+                        task.cancel()
+
+                    new_audio_event.clear()
+                    silence_detected_event.clear()
+
+                    if stop_event.is_set():
+                        break
+
+                    if not streamer.should_transcribe():
+                        continue
+
+                    # This runs in executor — if stop arrives during transcription,
+                    # the transcription completes naturally, result is preserved,
+                    # then loop checks stop_event on next iteration and exits
+                    delta = await loop.run_in_executor(None, streamer.transcribe_and_commit)
+                    if delta:
+                        await ws.send_json(
+                            {
+                                "type": "transcript",
+                                "text": delta,
+                                "is_final": False,
+                            }
+                        )
+
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Error in streaming loop")
+
+        streaming_task = asyncio.create_task(_streaming_loop())
+
+        # Wait for streaming loop to finish (exits when stop_event is set)
+        await streaming_task
+
+        # Finalize: get remaining uncommitted words
+        if not disconnected.is_set():
+            final = await loop.run_in_executor(None, streamer.finalize)
+            full_text = streamer.committed_text
+            logger.info("Finalize: full_text='%s'", full_text[:80] if full_text else "")
+            await ws.send_json(
+                {
+                    "type": "transcript",
+                    "text": final if final else "",
+                    "is_final": True,
+                    "full_text": full_text,
+                }
+            )
 
     except WebSocketDisconnect:
         logger.info("Streaming STT WebSocket disconnected")
     except Exception:
-        logger.error("Streaming STT error", exc_info=True)
-        try:
+        logger.exception("Streaming STT error")
+        with contextlib.suppress(Exception):
             await ws.send_json({"type": "error", "message": "Internal server error"})
-        except Exception:
-            pass
     finally:
+        stop_event.set()
+        recv_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await recv_task
         model_ctx.__exit__(None, None, None)
         logger.info("Streaming STT WebSocket closed")

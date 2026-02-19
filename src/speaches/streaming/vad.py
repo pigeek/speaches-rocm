@@ -7,11 +7,33 @@ used to trigger early transcription when the speaker pauses.
 from __future__ import annotations
 
 import logging
+import threading
 
 import numpy as np
 import torch
 
 _logger = logging.getLogger(__name__)
+
+_vad_model = None
+_vad_lock = threading.Lock()
+
+
+def _get_vad_model() -> torch.nn.Module:
+    """Load Silero VAD model (cached, thread-safe)."""
+    global _vad_model
+    if _vad_model is None:
+        with _vad_lock:
+            if _vad_model is None:
+                _logger.info("Loading Silero VAD model...")
+                model, _ = torch.hub.load(
+                    repo_or_dir="snakers4/silero-vad",
+                    model="silero_vad",
+                    trust_repo=True,
+                )
+                model.eval()
+                _vad_model = model
+                _logger.info("Silero VAD model loaded")
+    return _vad_model
 
 
 class SileroVADDetector:
@@ -21,21 +43,9 @@ class SileroVADDetector:
     """
 
     def __init__(self, threshold: float = 0.5, min_silence_ms: int = 500) -> None:
-        """Initialize Silero VAD.
-
-        Args:
-            threshold: Speech probability threshold (0-1).
-            min_silence_ms: Minimum silence duration (ms) to trigger end of speech.
-        """
         self.threshold = threshold
         self.min_silence_ms = min_silence_ms
-
-        self.model, _ = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            trust_repo=True,
-        )
-        self.model.eval()
+        self.model = _get_vad_model()
         self._reset_states()
 
     def _reset_states(self) -> None:

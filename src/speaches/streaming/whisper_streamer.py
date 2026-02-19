@@ -95,12 +95,22 @@ class WhisperStreamer:
         """Full committed text so far."""
         return self._committed_text
 
+    @property
+    def silence_triggered(self) -> bool:
+        """Whether VAD has detected silence since last transcription."""
+        return self._silence_triggered
+
     def push_audio(self, pcm_bytes: bytes) -> None:
         """Accumulate PCM16 audio data.
 
         Args:
             pcm_bytes: Raw 16-bit signed little-endian PCM at 16 kHz mono.
         """
+        # Ensure even number of bytes for int16 parsing
+        if len(pcm_bytes) % 2 != 0:
+            pcm_bytes = pcm_bytes[:-1]
+        if not pcm_bytes:
+            return
         samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         self._audio_buffer = np.append(self._audio_buffer, samples)
         self._samples_since_last_transcribe += len(samples)
@@ -185,9 +195,17 @@ class WhisperStreamer:
             Any remaining text that wasn't committed during streaming.
         """
         remaining = self._hypothesis_buffer.complete()
+        _logger.info(
+            "Finalize: hypothesis_buffer.complete() returned %d words, committed_text='%s', buffer=%.1fs",
+            len(remaining),
+            self._committed_text[:40] if self._committed_text else "",
+            len(self._audio_buffer) / SAMPLING_RATE,
+        )
 
-        # If no streaming happened (very short audio), do a single transcription
-        if not self._committed_text and len(self._audio_buffer) > 0:
+        # If nothing was committed AND hypothesis buffer is empty, do a single transcription
+        # (e.g. very short audio where LA2 never ran, or only ran once so complete() is empty)
+        if not self._committed_text and not remaining and len(self._audio_buffer) > 0:
+            _logger.info("Finalize: no committed text and no remaining words, running fresh transcription")
             words = self._transcribe_buffer()
             if words:
                 remaining = words
@@ -200,6 +218,7 @@ class WhisperStreamer:
 
         if text:
             self._committed_text += text
+        _logger.info("Finalize result: '%s'", text[:80] if text else "")
         return text
 
     def _prompt(self) -> str:
@@ -223,9 +242,10 @@ class WhisperStreamer:
     def _transcribe_buffer(self) -> list[Word]:
         """Transcribe current audio buffer and return word list."""
         prompt = self._prompt()
+        audio_duration = len(self._audio_buffer) / SAMPLING_RATE
 
         try:
-            segments_generator, _info = self._model.transcribe(
+            segments_generator, info = self._model.transcribe(
                 self._audio_buffer,
                 language=self._language,
                 initial_prompt=prompt if prompt else None,
@@ -234,13 +254,26 @@ class WhisperStreamer:
             )
 
             words: list[Word] = []
+            segment_count = 0
             for segment in segments_generator:
+                segment_count += 1
+                _logger.debug(
+                    "Segment %d: no_speech_prob=%.3f, text='%s', words=%d",
+                    segment_count,
+                    segment.no_speech_prob,
+                    segment.text[:50] if segment.text else "",
+                    len(segment.words) if hasattr(segment, "words") and segment.words else 0,
+                )
                 if segment.no_speech_prob > 0.9:
                     continue
                 if hasattr(segment, "words") and segment.words:
                     for w in segment.words:
                         words.append(Word(w.start, w.end, w.word))
 
+            _logger.info(
+                "Transcribed %.1fs audio: %d segments, %d words, lang=%s",
+                audio_duration, segment_count, len(words), info.language,
+            )
             return words
         except Exception:
             _logger.error("Transcription error", exc_info=True)

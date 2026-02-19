@@ -107,3 +107,13 @@ class ExecutorRegistry:
             if model_id in [model.id for model in executor.model_registry.list_remote_models()]:
                 return executor.model_registry.download_model_files_if_not_exist(model_id)
         raise ValueError(f"Model '{model_id}' not found")
+
+    def warmup_model_by_id(self, model_id: str) -> None:
+        for executor in self.all_executors():
+            if model_id in [model.id for model in executor.model_registry.list_remote_models()]:
+                executor.model_registry.download_model_files_if_not_exist(model_id)
+                model_ctx = executor.model_manager.load_model(model_id)
+                model_ctx.__enter__()
+                model_ctx.__exit__(None, None, None)
+                return
+        raise ValueError(f"Model '{model_id}' not found")

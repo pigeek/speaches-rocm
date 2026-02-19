@@ -60,5 +60,8 @@ ENV UVICORN_HOST=0.0.0.0 \
 
 RUN mkdir -p /root/.cache/huggingface/hub
 
+# Pre-download Silero VAD model so it's cached in the image (not downloaded at runtime)
+RUN python -c "import torch; torch.hub.load('snakers4/silero-vad', 'silero_vad', trust_repo=True)"
+
 EXPOSE 8000
 CMD ["uvicorn", "--factory", "speaches.main:create_app"]
