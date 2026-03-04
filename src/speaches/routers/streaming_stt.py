@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["streaming-stt"])
 
-DEFAULT_MODEL = "Systran/faster-whisper-large-v3"
+DEFAULT_MODEL = "Systran/faster-distil-whisper-large-v3"
 
 
 @router.websocket("/v1/audio/transcriptions/stream")
